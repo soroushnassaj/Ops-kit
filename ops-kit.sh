@@ -6,6 +6,7 @@ PROJECT_DIR=""
 
 if [[ $EUID -eq 0 ]]; then SUDO=""; else SUDO="sudo"; fi
 
+
 info() { printf '\033[1;34m[*]\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m[OK]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*"; }
@@ -17,7 +18,7 @@ fi
 
 load_config() {
   if [[ -f "$CONFIG_FILE" ]]; then
-    
+    # shellcheck disable=SC1090
     source "$CONFIG_FILE"
   fi
   return 0
@@ -49,6 +50,7 @@ confirm() {
   [[ "$r" =~ ^[Yy]$ ]]
 }
 
+
 dk() {
   if docker info >/dev/null 2>&1; then
     docker "$@"
@@ -66,6 +68,7 @@ normalize_repo() {
   r="${r%/}"
   echo "$r"
 }
+
 
 ensure_repo_info() {
   load_config
@@ -91,6 +94,7 @@ require_project_dir() {
   [[ -d "$PROJECT_DIR" ]] || die "Project directory not found: $PROJECT_DIR (run step 3 first)."
 }
 
+
 step_system() {
   command -v apt-get >/dev/null 2>&1 || die "This script supports Debian/Ubuntu (apt) only."
   info "Updating system packages..."
@@ -100,6 +104,7 @@ step_system() {
   $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y git curl
   ok "System is up to date. $(git --version)"
 }
+
 
 step_docker() {
   if command -v docker >/dev/null 2>&1; then
@@ -133,6 +138,7 @@ step_docker() {
     fi
   fi
 }
+
 
 ssh_ok() {
   local out
@@ -238,6 +244,7 @@ EOF
   ok "Repository is ready at $PROJECT_DIR"
 }
 
+
 read_multiline() {
   ENV_CONTENT=""
   local line
@@ -246,6 +253,8 @@ read_multiline() {
     ENV_CONTENT+="$line"$'\n'
   done
 }
+
+
 
 resolve_target_dir() {
   local rel="$1" base
@@ -312,6 +321,7 @@ step_env() {
   done
 }
 
+
 has_compose_file() {
   local f
   for f in compose.yaml compose.yml docker-compose.yaml docker-compose.yml; do
@@ -322,6 +332,7 @@ has_compose_file() {
 
 step_build() {
   require_project_dir
+  warn_low_memory
   has_compose_file || die "No compose file found in $PROJECT_DIR."
   command -v docker >/dev/null 2>&1 || die "Docker is not installed. Run step 2 first."
   cd "$PROJECT_DIR"
@@ -341,6 +352,106 @@ step_up() {
   dk compose ps
   ok "Containers are up."
 }
+
+
+swap_total_kb() { awk '/^SwapTotal:/ {print $2}' /proc/meminfo; }
+mem_total_kb()  { awk '/^MemTotal:/ {print $2}' /proc/meminfo; }
+
+# Prints a hint (never fails) when the server is low on RAM and has no swap
+warn_low_memory() {
+  if [[ "$(swap_total_kb)" -eq 0 && "$(mem_total_kb)" -lt 1500000 ]]; then
+    warn "Low memory (< 1.5 GB RAM) and no swap. The build may time out or get killed."
+    warn "Run menu option 9 (Check / fix swap) first."
+  fi
+  return 0
+}
+
+step_swap() {
+  local swapfile="/swapfile" size num unit need_mb avail_mb total_kb oom active
+
+  info "Memory and swap status:"
+  free -h
+  echo
+  swapon --show 2>/dev/null || true
+  echo
+
+  info "Recent out-of-memory kills (kernel log):"
+  oom="$($SUDO dmesg 2>/dev/null | grep -i -E 'out of memory|killed process' | tail -5 || true)"
+  if [[ -n "$oom" ]]; then
+    warn "Found OOM kills (processes were killed because memory ran out):"
+    echo "$oom"
+  else
+    ok "None found."
+  fi
+  echo
+
+
+  total_kb="$(swap_total_kb)"
+  if [[ "$total_kb" -gt 0 ]]; then
+    ok "Swap is active: $((total_kb / 1024)) MiB."
+    active="$(swapon --show=NAME --noheadings 2>/dev/null || true)"
+    if grep -qx "$swapfile" <<<"$active" && ! grep -qE '^[[:space:]]*/swapfile[[:space:]]' /etc/fstab; then
+      warn "$swapfile is active but missing from /etc/fstab, so it would be lost after a reboot."
+      if confirm "Add it to /etc/fstab now?"; then
+        echo "$swapfile none swap sw 0 0" | $SUDO tee -a /etc/fstab >/dev/null
+        ok "Added to /etc/fstab."
+      fi
+    fi
+    return 0
+  fi
+
+
+  warn "No active swap. Builds on low-memory servers may time out or get killed."
+  if ! confirm "Create a swap file now?"; then
+    return 0
+  fi
+
+  ask "Swap size (e.g. 512M, 1G, 2G, 4G)" size "2G"
+  [[ "$size" =~ ^([0-9]+)([MmGg])$ ]] || die "Invalid size. Use a number followed by M or G, for example 2G."
+  num="${BASH_REMATCH[1]}"
+  unit="${BASH_REMATCH[2]^^}"
+  if [[ "$unit" == "G" ]]; then need_mb=$((num * 1024)); else need_mb=$num; fi
+  [[ "$need_mb" -ge 128 ]] || die "Size too small (minimum 128M)."
+  size="${num}${unit}"
+
+  avail_mb="$(df -Pm / | awk 'NR==2 {print $4}')"
+  if [[ "$avail_mb" -lt $((need_mb + 512)) ]]; then
+    die "Not enough free disk space (${avail_mb} MiB free; need ${need_mb} MiB plus ~512 MiB headroom)."
+  fi
+
+
+  if [[ -e "$swapfile" ]]; then
+    info "$swapfile already exists. Trying to activate it..."
+    if $SUDO swapon "$swapfile" 2>/dev/null; then
+      ok "Activated the existing $swapfile (size unchanged)."
+    else
+      warn "The existing $swapfile could not be activated. Recreating it..."
+      $SUDO rm -f "$swapfile"
+    fi
+  fi
+
+  if [[ "$(swap_total_kb)" -eq 0 ]]; then
+    info "Creating a ${size} swap file at $swapfile ..."
+    if ! $SUDO fallocate -l "$size" "$swapfile" 2>/dev/null; then
+      warn "fallocate failed on this filesystem; falling back to dd (slower)..."
+      $SUDO dd if=/dev/zero of="$swapfile" bs=1M count="$need_mb" status=progress
+    fi
+    $SUDO chmod 600 "$swapfile"
+    $SUDO mkswap "$swapfile" >/dev/null
+    $SUDO swapon "$swapfile"
+  fi
+
+  if ! grep -qE '^[[:space:]]*/swapfile[[:space:]]' /etc/fstab; then
+    echo "$swapfile none swap sw 0 0" | $SUDO tee -a /etc/fstab >/dev/null
+    info "Added $swapfile to /etc/fstab (persists after reboot)."
+  fi
+
+  echo
+  [[ "$(swap_total_kb)" -gt 0 ]] || die "Swap is still not active. Check the output above."
+  free -h
+  ok "Swap is active and persistent."
+}
+
 
 step_all() {
   info ">>> Step 1/6: system update & git"
@@ -388,6 +499,7 @@ show_menu() {
   echo "  6) Docker compose up -d"
   echo "  7) Run ALL steps (1-6)"
   echo "  8) Change repo / project path"
+  echo "  9) Check / fix swap (low-memory servers)"
   echo "  0) Exit"
   echo "=========================================="
 }
@@ -407,6 +519,7 @@ main() {
       6) run_action step_up ;;
       7) run_action step_all ;;
       8) rm -f "$CONFIG_FILE"; REPO_FULL=""; PROJECT_DIR=""; run_action ensure_repo_info ;;
+      9) run_action step_swap ;;
       0|q|Q) echo "Bye."; exit 0 ;;
       *) warn "Invalid option." ;;
     esac
