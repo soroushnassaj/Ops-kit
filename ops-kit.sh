@@ -1,3 +1,5 @@
+#!/usr/bin/env bash
+
 set -uo pipefail
 
 CONFIG_FILE="$HOME/.ops-kit.conf"
@@ -5,7 +7,6 @@ REPO_FULL=""
 PROJECT_DIR=""
 
 if [[ $EUID -eq 0 ]]; then SUDO=""; else SUDO="sudo"; fi
-
 
 info() { printf '\033[1;34m[*]\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m[OK]\033[0m %s\n' "$*"; }
@@ -18,7 +19,6 @@ fi
 
 load_config() {
   if [[ -f "$CONFIG_FILE" ]]; then
-    # shellcheck disable=SC1090
     source "$CONFIG_FILE"
   fi
   return 0
@@ -31,7 +31,6 @@ save_config() {
   } > "$CONFIG_FILE"
   chmod 600 "$CONFIG_FILE"
 }
-
 
 ask() {
   local prompt="$1" __var="$2" def="${3:-}" reply
@@ -50,7 +49,6 @@ confirm() {
   [[ "$r" =~ ^[Yy]$ ]]
 }
 
-
 dk() {
   if docker info >/dev/null 2>&1; then
     docker "$@"
@@ -68,7 +66,6 @@ normalize_repo() {
   r="${r%/}"
   echo "$r"
 }
-
 
 ensure_repo_info() {
   load_config
@@ -94,7 +91,6 @@ require_project_dir() {
   [[ -d "$PROJECT_DIR" ]] || die "Project directory not found: $PROJECT_DIR (run step 3 first)."
 }
 
-
 step_system() {
   command -v apt-get >/dev/null 2>&1 || die "This script supports Debian/Ubuntu (apt) only."
   info "Updating system packages..."
@@ -104,7 +100,6 @@ step_system() {
   $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y git curl
   ok "System is up to date. $(git --version)"
 }
-
 
 step_docker() {
   if command -v docker >/dev/null 2>&1; then
@@ -138,7 +133,6 @@ step_docker() {
     fi
   fi
 }
-
 
 ssh_ok() {
   local out
@@ -244,7 +238,6 @@ EOF
   ok "Repository is ready at $PROJECT_DIR"
 }
 
-
 read_multiline() {
   ENV_CONTENT=""
   local line
@@ -253,8 +246,6 @@ read_multiline() {
     ENV_CONTENT+="$line"$'\n'
   done
 }
-
-
 
 resolve_target_dir() {
   local rel="$1" base
@@ -321,7 +312,6 @@ step_env() {
   done
 }
 
-
 has_compose_file() {
   local f
   for f in compose.yaml compose.yml docker-compose.yaml docker-compose.yml; do
@@ -353,11 +343,9 @@ step_up() {
   ok "Containers are up."
 }
 
-
 swap_total_kb() { awk '/^SwapTotal:/ {print $2}' /proc/meminfo; }
 mem_total_kb()  { awk '/^MemTotal:/ {print $2}' /proc/meminfo; }
 
-# Prints a hint (never fails) when the server is low on RAM and has no swap
 warn_low_memory() {
   if [[ "$(swap_total_kb)" -eq 0 && "$(mem_total_kb)" -lt 1500000 ]]; then
     warn "Low memory (< 1.5 GB RAM) and no swap. The build may time out or get killed."
@@ -385,7 +373,6 @@ step_swap() {
   fi
   echo
 
-
   total_kb="$(swap_total_kb)"
   if [[ "$total_kb" -gt 0 ]]; then
     ok "Swap is active: $((total_kb / 1024)) MiB."
@@ -399,7 +386,6 @@ step_swap() {
     fi
     return 0
   fi
-
 
   warn "No active swap. Builds on low-memory servers may time out or get killed."
   if ! confirm "Create a swap file now?"; then
@@ -418,7 +404,6 @@ step_swap() {
   if [[ "$avail_mb" -lt $((need_mb + 512)) ]]; then
     die "Not enough free disk space (${avail_mb} MiB free; need ${need_mb} MiB plus ~512 MiB headroom)."
   fi
-
 
   if [[ -e "$swapfile" ]]; then
     info "$swapfile already exists. Trying to activate it..."
@@ -452,6 +437,204 @@ step_swap() {
   ok "Swap is active and persistent."
 }
 
+valid_domain() {
+  [[ "$1" =~ ^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,}$ ]]
+}
+
+need_openssl() {
+  command -v openssl >/dev/null 2>&1 && return 0
+  $SUDO apt-get install -y openssl
+}
+
+ensure_certbot() {
+  command -v certbot >/dev/null 2>&1 && return 0
+  info "Installing certbot..."
+  $SUDO apt-get update
+  $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y certbot
+}
+
+ssl_get() {
+  local domain extra email public_ip resolved listen
+  local args=()
+
+  ask "Domain name (must already point to this server, e.g. example.com)" domain
+  valid_domain "$domain" || die "Invalid domain name. A certificate cannot be issued for a bare IP address."
+  ask "Extra domain such as www.$domain (leave empty for none)" extra
+  if [[ -n "$extra" ]]; then
+    valid_domain "$extra" || die "Invalid extra domain name."
+  fi
+  ask "Email for expiry notices" email
+  [[ "$email" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]] || die "Invalid email address."
+
+  command -v curl >/dev/null 2>&1 || $SUDO apt-get install -y curl
+  public_ip="$(curl -4 -fsS -m 10 https://api.ipify.org 2>/dev/null || true)"
+  resolved="$(getent ahostsv4 "$domain" | awk 'NR==1 {print $1}' || true)"
+  if [[ -z "$resolved" ]]; then
+    die "$domain does not resolve to any IP yet. Create the DNS A record first and wait for it to propagate."
+  fi
+  if [[ -n "$public_ip" && "$resolved" != "$public_ip" ]]; then
+    warn "$domain points to $resolved but this server's public IP is $public_ip."
+    confirm "Continue anyway?" || die "Aborted."
+  fi
+
+  listen="$($SUDO ss -ltn 2>/dev/null || true)"
+  if grep -qE ':80[[:space:]]' <<<"$listen"; then
+    die "Port 80 is already in use. Stop whatever is using it (for example a container publishing port 80) and try again."
+  fi
+
+  ensure_certbot
+  args=(certonly --standalone --non-interactive --agree-tos --no-eff-email -m "$email" -d "$domain")
+  if [[ -n "$extra" ]]; then
+    args+=(-d "$extra")
+  fi
+
+  info "Requesting the certificate (port 80 must be reachable from the internet)..."
+  $SUDO certbot "${args[@]}"
+
+  ok "Certificate issued."
+  echo "  Certificate: /etc/letsencrypt/live/$domain/fullchain.pem"
+  echo "  Private key: /etc/letsencrypt/live/$domain/privkey.pem"
+  echo "  Automatic renewal is handled by the certbot systemd timer."
+  echo
+  if confirm "Test automatic renewal now (dry run)?"; then
+    $SUDO certbot renew --dry-run
+  fi
+}
+
+ssl_import() {
+  local domain method src_cert src_key host rcert rkey tmp dest c k
+  ask "Domain name this certificate belongs to (used as the folder name)" domain
+  valid_domain "$domain" || die "Invalid domain name."
+  need_openssl
+
+  dest="/etc/ssl/ops-kit/$domain"
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT
+
+  echo "  1) Files already on this server"
+  echo "  2) Download from another server over SSH (scp)"
+  echo "  3) Paste the PEM text"
+  ask "Choose a method" method "1"
+
+  case "$method" in
+    1)
+      ask "Path to the certificate (fullchain) file" src_cert
+      ask "Path to the private key file" src_key
+      src_cert="${src_cert/#\~/$HOME}"
+      src_key="${src_key/#\~/$HOME}"
+      $SUDO test -f "$src_cert" || die "File not found: $src_cert"
+      $SUDO test -f "$src_key" || die "File not found: $src_key"
+      $SUDO cp -L "$src_cert" "$tmp/fullchain.pem"
+      $SUDO cp -L "$src_key" "$tmp/privkey.pem"
+      $SUDO chown -R "$(id -u):$(id -g)" "$tmp"
+      ;;
+    2)
+      warn "The SSH user must be able to read both files on the old server (use root, or copy them somewhere readable first)."
+      ask "SSH login of the old server (for example root@1.2.3.4)" host
+      [[ "$host" =~ ^[A-Za-z0-9._@-]+$ ]] || die "Invalid SSH login."
+      ask "Certificate path on the old server" rcert "/etc/letsencrypt/live/$domain/fullchain.pem"
+      ask "Private key path on the old server" rkey "/etc/letsencrypt/live/$domain/privkey.pem"
+      [[ "$rcert" =~ ^[A-Za-z0-9._/-]+$ ]] || die "Invalid certificate path."
+      [[ "$rkey" =~ ^[A-Za-z0-9._/-]+$ ]] || die "Invalid key path."
+      scp -o StrictHostKeyChecking=accept-new "$host:$rcert" "$tmp/fullchain.pem"
+      scp -o StrictHostKeyChecking=accept-new "$host:$rkey" "$tmp/privkey.pem"
+      ;;
+    3)
+      echo "Paste the certificate (fullchain PEM). Finish with a line containing only EOF."
+      read_multiline
+      printf '%s' "$ENV_CONTENT" > "$tmp/fullchain.pem"
+      echo "Paste the private key. Finish with a line containing only EOF."
+      read_multiline
+      printf '%s' "$ENV_CONTENT" > "$tmp/privkey.pem"
+      ;;
+    *)
+      die "Invalid method."
+      ;;
+  esac
+
+  openssl x509 -in "$tmp/fullchain.pem" -noout >/dev/null 2>&1 || die "The certificate is not a valid PEM certificate."
+  openssl pkey -in "$tmp/privkey.pem" -passin pass: -noout >/dev/null 2>&1 || die "The private key is invalid or password-protected."
+  c="$(openssl x509 -in "$tmp/fullchain.pem" -noout -pubkey | openssl sha256)"
+  k="$(openssl pkey -in "$tmp/privkey.pem" -passin pass: -pubout | openssl sha256)"
+  [[ "$c" == "$k" ]] || die "The private key does not match the certificate."
+  if ! openssl x509 -in "$tmp/fullchain.pem" -noout -checkend 0 >/dev/null 2>&1; then
+    warn "This certificate has already expired."
+  fi
+
+  $SUDO mkdir -p "$dest"
+  $SUDO install -m 644 -o root -g root "$tmp/fullchain.pem" "$dest/fullchain.pem"
+  $SUDO install -m 600 -o root -g root "$tmp/privkey.pem" "$dest/privkey.pem"
+
+  ok "Certificate imported and verified (key matches)."
+  openssl x509 -in "$dest/fullchain.pem" -noout -subject -enddate 2>/dev/null || $SUDO openssl x509 -in "$dest/fullchain.pem" -noout -subject -enddate
+  echo "  Certificate: $dest/fullchain.pem"
+  echo "  Private key: $dest/privkey.pem"
+  warn "Imported certificates are not renewed automatically. Renew it where it was issued, or issue a new one here with option 1."
+}
+
+ssl_pack() {
+  local domain src tmp out
+  ask "Domain name of the certificate to pack" domain
+  valid_domain "$domain" || die "Invalid domain name."
+
+  if $SUDO test -f "/etc/letsencrypt/live/$domain/fullchain.pem"; then
+    src="/etc/letsencrypt/live/$domain"
+  elif $SUDO test -f "/etc/ssl/ops-kit/$domain/fullchain.pem"; then
+    src="/etc/ssl/ops-kit/$domain"
+  else
+    die "No certificate for $domain found on this server."
+  fi
+
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT
+  out="$HOME/ssl-${domain}-$(date +%Y%m%d).tar.gz"
+  $SUDO cp -L "$src/fullchain.pem" "$src/privkey.pem" "$tmp/"
+  $SUDO chown -R "$(id -u):$(id -g)" "$tmp"
+  tar -czf "$out" -C "$tmp" fullchain.pem privkey.pem
+  chmod 600 "$out"
+
+  ok "Created $out"
+  echo "Copy it to the new server with:"
+  echo "  scp $out USER@NEW_SERVER_IP:~/"
+  echo "Then unpack it there and run option 2 (method 1) of this menu entry."
+  warn "The archive contains the private key. Delete it after the transfer."
+}
+
+ssl_list() {
+  local dirs d found=0
+  need_openssl
+  dirs="$($SUDO sh -c 'ls -d /etc/letsencrypt/live/*/ /etc/ssl/ops-kit/*/ 2>/dev/null' || true)"
+  while IFS= read -r d; do
+    [[ -n "$d" ]] || continue
+    d="${d%/}"
+    if $SUDO test -f "$d/fullchain.pem"; then
+      found=1
+      echo "$d"
+      $SUDO openssl x509 -in "$d/fullchain.pem" -noout -subject -enddate | sed 's/^/    /'
+    fi
+  done <<<"$dirs"
+  if [[ "$found" -eq 0 ]]; then
+    info "No certificates found."
+  fi
+}
+
+step_ssl() {
+  local choice
+  echo "  1) Get a free certificate (Let's Encrypt, needs a domain)"
+  echo "  2) Import an existing certificate (files, scp, or paste)"
+  echo "  3) Pack a certificate to move it to another server"
+  echo "  4) Show installed certificates and expiry dates"
+  echo "  0) Back"
+  ask "Choose" choice
+  case "$choice" in
+    1) ssl_get ;;
+    2) ssl_import ;;
+    3) ssl_pack ;;
+    4) ssl_list ;;
+    0|"") return 0 ;;
+    *) die "Invalid choice." ;;
+  esac
+}
 
 step_all() {
   info ">>> Step 1/6: system update & git"
@@ -500,6 +683,7 @@ show_menu() {
   echo "  7) Run ALL steps (1-6)"
   echo "  8) Change repo / project path"
   echo "  9) Check / fix swap (low-memory servers)"
+  echo " 10) SSL certificate (get / import / move)"
   echo "  0) Exit"
   echo "=========================================="
 }
@@ -520,6 +704,7 @@ main() {
       7) run_action step_all ;;
       8) rm -f "$CONFIG_FILE"; REPO_FULL=""; PROJECT_DIR=""; run_action ensure_repo_info ;;
       9) run_action step_swap ;;
+      10) run_action step_ssl ;;
       0|q|Q) echo "Bye."; exit 0 ;;
       *) warn "Invalid option." ;;
     esac
